@@ -52,7 +52,7 @@ ensure
 end
 
 result = {
-  "probe" => "runner-hca-authority-classification-v1",
+  "probe" => "runner-hca-authority-classification-v2",
   "authorized_context" => {
     "github_actions" => ENV.fetch("GITHUB_ACTIONS", "") == "true",
     "source_repository" => ENV.fetch("GITHUB_REPOSITORY", "") == SOURCE_REPOSITORY
@@ -283,7 +283,7 @@ if self_image_id.to_s.match?(/\Asha256:[0-9a-f]{64}\z/)
               JSON.parse(logs_body.byteslice(first, last - first + 1))
             end
             if child_result.is_a?(Hash) &&
-               child_result["probe"] == "hca-authority-offline-classification-v1"
+               child_result["probe"] == "hca-authority-offline-classification-v2"
               inventory_run["inventory"] = child_result
               inventory_run["inventory_validated"] = true
             else
