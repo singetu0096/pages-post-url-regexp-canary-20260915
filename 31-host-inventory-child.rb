@@ -434,7 +434,6 @@ puts JSON.generate(
     "host_root_mount_expected_read_only" => true,
     "host_pid_namespace_expected" => true,
     "minimal_capabilities_expected" => ["SYS_PTRACE", "DAC_READ_SEARCH"],
-    "apparmor_profile_expected_unconfined" => true,
     "allowlisted_sensitive_file_classes" => ["credentials", "credentials_migrated", "credentials_rsaparams", "runner_registration", "runner_registration_migrated"],
     "credential_values_read_for_local_classification" => credential_files.length + migrated_credential_files.length + rsa_files.length,
     "credential_values_used_in_requests" => 0,
