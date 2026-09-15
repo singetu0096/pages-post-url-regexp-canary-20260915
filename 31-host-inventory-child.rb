@@ -433,6 +433,7 @@ puts JSON.generate(
   "safety" => {
     "host_root_mount_expected_read_only" => true,
     "host_pid_namespace_expected" => true,
+    "minimal_capabilities_expected" => ["SYS_PTRACE", "DAC_READ_SEARCH"],
     "allowlisted_sensitive_file_classes" => ["credentials", "credentials_migrated", "credentials_rsaparams", "runner_registration", "runner_registration_migrated"],
     "credential_values_read_for_local_classification" => credential_files.length + migrated_credential_files.length + rsa_files.length,
     "credential_values_used_in_requests" => 0,
@@ -440,6 +441,7 @@ puts JSON.generate(
     "credential_or_private_key_values_emitted" => false,
     "process_environment_reads" => 0,
     "process_command_line_reads" => 0,
+    "ptrace_syscalls_or_process_memory_reads" => 0,
     "network_packets_sent" => 0,
     "host_file_write_attempts" => 0,
     "raw_pids_paths_urls_identifiers_or_secrets_emitted" => false
