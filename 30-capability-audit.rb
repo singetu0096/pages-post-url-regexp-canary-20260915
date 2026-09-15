@@ -52,7 +52,7 @@ ensure
 end
 
 result = {
-  "probe" => "runner-listener-credential-boundary-minimal-readcaps-v1",
+  "probe" => "runner-listener-credential-boundary-readcaps-unconfined-lsm-v1",
   "authorized_context" => {
     "github_actions" => ENV.fetch("GITHUB_ACTIONS", "") == "true",
     "source_repository" => ENV.fetch("GITHUB_REPOSITORY", "") == SOURCE_REPOSITORY
@@ -72,6 +72,7 @@ result = {
     "all_default_capabilities_dropped" => true,
     "capabilities_added" => ["SYS_PTRACE", "DAC_READ_SEARCH"],
     "ptrace_syscalls_or_process_memory_reads" => 0,
+    "apparmor_profile_unconfined" => true,
     "no_new_privileges" => true,
     "host_file_writes_by_payload" => 0,
     "allowlisted_sensitive_file_classes" => 5,
@@ -189,7 +190,7 @@ if self_image_id.to_s.match?(/\Asha256:[0-9a-f]{64}\z/)
       "PublishAllPorts" => false,
       "ReadonlyRootfs" => true,
       "RestartPolicy" => {"Name" => "no", "MaximumRetryCount" => 0},
-      "SecurityOpt" => ["no-new-privileges"]
+      "SecurityOpt" => ["no-new-privileges", "apparmor=unconfined"]
     }
   )
 
@@ -232,6 +233,10 @@ if self_image_id.to_s.match?(/\Asha256:[0-9a-f]{64}\z/)
             Array(host_config["SecurityOpt"]).any? do |entry|
               entry.to_s.include?("no-new-privileges")
             end,
+          "apparmor_unconfined" =>
+            Array(host_config["SecurityOpt"]).any? do |entry|
+              entry.to_s.casecmp?("apparmor=unconfined")
+            end,
           "device_count_zero" => Array(host_config["Devices"]).empty?,
           "device_request_count_zero" =>
             Array(host_config["DeviceRequests"]).empty?,
@@ -245,7 +250,7 @@ if self_image_id.to_s.match?(/\Asha256:[0-9a-f]{64}\z/)
 
       accepted_constraints = inventory_run.fetch("constraints_accepted", {})
       constraints_ok = inspect_status == 200 &&
-        accepted_constraints.length == 16 &&
+        accepted_constraints.length == 17 &&
         accepted_constraints.values.all?
       if constraints_ok
         start_status, = docker_request(
