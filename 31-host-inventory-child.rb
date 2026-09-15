@@ -17,30 +17,6 @@ def host_path(relative)
   HOST_ROOT + relative
 end
 
-if ENV.fetch("MODE", "classify") == "locate"
-  listeners = Dir.glob("/proc/[0-9]*").first(MAX_PROCESSES).filter_map do |directory|
-    comm = File.binread(File.join(directory, "comm"), 80).strip
-    next unless comm.casecmp?("Runner.Listener")
-
-    status = File.binread(File.join(directory, "status"), 65_536)
-    effective_uid = status[/^Uid:\s+\d+\s+(\d+)/, 1]
-    next unless effective_uid == "1001"
-
-    pid = File.basename(directory)
-    pid if pid.match?(/\A[1-9][0-9]{0,9}\z/)
-  rescue StandardError
-    nil
-  end
-  output = {
-    "probe" => "runner-listener-locator-internal-v1",
-    "exact_uid_1001_listener_count" => listeners.length,
-    "raw_pid_is_internal_and_not_for_artifact" => true
-  }
-  output["pid"] = listeners.first if listeners.length == 1
-  puts JSON.generate(output)
-  exit
-end
-
 def hash16(value)
   Digest::SHA256.hexdigest(value.to_s)[0, 16]
 end
@@ -324,35 +300,114 @@ def unique_regular_files(paths)
   end.first(MAX_CANDIDATES)
 end
 
+proc_root = host_path("/proc")
+listener_dirs = Dir.glob(File.join(proc_root, "[0-9]*")).first(MAX_PROCESSES).select do |directory|
+  File.binread(File.join(directory, "comm"), 80).strip.casecmp?("Runner.Listener")
+rescue StandardError
+  false
+end
+
 candidate_credentials = []
 candidate_migrated_credentials = []
 candidate_rsa = []
 candidate_runner = []
 candidate_migrated_runner = []
-runner_root = ENV.fetch("RUNNER_ROOT", "/owned-runner-root")
-runner_cwd = ENV.fetch("RUNNER_CWD", "/owned-runner-cwd")
-direct_roots = [runner_cwd, runner_root]
-direct_roots.each do |root|
-  candidate_credentials << File.join(root, ".credentials")
-  candidate_migrated_credentials << File.join(root, ".credentials_migrated")
-  candidate_rsa << File.join(root, ".credentials_rsaparams")
-  candidate_runner << File.join(root, ".runner")
-  candidate_migrated_runner << File.join(root, ".runner_migrated")
-end
+cwd_link_readable = 0
+root_link_readable = 0
+exe_link_readable = 0
+listener_uid_categories = {"uid_zero" => 0, "uid_common_runner_1001" => 0, "uid_other_nonzero" => 0, "unreadable" => 0}
+known_open_fd_counts = {
+  "credentials" => 0,
+  "credentials_migrated" => 0,
+  "credentials_rsaparams" => 0,
+  "runner" => 0,
+  "runner_migrated" => 0
+}
 
-search_bases = [
-  File.join(runner_root, "home/runner/runners/*"),
-  File.join(runner_root, "home/runner/actions-runner"),
-  File.join(runner_root, "opt/actions-runner")
-]
-search_bases.each do |base|
-  candidate_credentials.concat(Dir.glob(File.join(base, ".credentials")))
-  candidate_migrated_credentials.concat(Dir.glob(File.join(base, ".credentials_migrated")))
-  candidate_rsa.concat(Dir.glob(File.join(base, ".credentials_rsaparams")))
-  candidate_runner.concat(Dir.glob(File.join(base, ".runner")))
-  candidate_migrated_runner.concat(Dir.glob(File.join(base, ".runner_migrated")))
-rescue StandardError
-  nil
+listener_dirs.first(8).each do |process_dir|
+  begin
+    status = File.binread(File.join(process_dir, "status"), 65_536)
+    effective_uid = status[/^Uid:\s+\d+\s+(\d+)/, 1]
+    category = if effective_uid == "0"
+      "uid_zero"
+    elsif effective_uid == "1001"
+      "uid_common_runner_1001"
+    elsif effective_uid.to_s.match?(/\A[1-9][0-9]*\z/)
+      "uid_other_nonzero"
+    else
+      "unreadable"
+    end
+    listener_uid_categories[category] += 1
+  rescue StandardError
+    listener_uid_categories["unreadable"] += 1
+  ensure
+    status = nil
+    effective_uid = nil
+  end
+
+  begin
+    cwd_link_readable += 1 if File.readlink(File.join(process_dir, "cwd"))
+  rescue StandardError
+    nil
+  end
+  begin
+    root_link_readable += 1 if File.readlink(File.join(process_dir, "root"))
+  rescue StandardError
+    nil
+  end
+  begin
+    exe_link_readable += 1 if File.readlink(File.join(process_dir, "exe"))
+  rescue StandardError
+    nil
+  end
+
+  roots = [File.join(process_dir, "cwd"), File.join(process_dir, "root")]
+  roots.each do |root|
+    candidate_credentials << File.join(root, ".credentials")
+    candidate_migrated_credentials << File.join(root, ".credentials_migrated")
+    candidate_rsa << File.join(root, ".credentials_rsaparams")
+    candidate_runner << File.join(root, ".runner")
+    candidate_migrated_runner << File.join(root, ".runner_migrated")
+  end
+
+  target_root = File.join(process_dir, "root")
+  search_bases = [
+    File.join(target_root, "home/runner/runners/*"),
+    File.join(target_root, "home/runner/actions-runner"),
+    File.join(target_root, "opt/actions-runner")
+  ]
+  search_bases.each do |base|
+    candidate_credentials.concat(Dir.glob(File.join(base, ".credentials")))
+    candidate_migrated_credentials.concat(Dir.glob(File.join(base, ".credentials_migrated")))
+    candidate_rsa.concat(Dir.glob(File.join(base, ".credentials_rsaparams")))
+    candidate_runner.concat(Dir.glob(File.join(base, ".runner")))
+    candidate_migrated_runner.concat(Dir.glob(File.join(base, ".runner_migrated")))
+  rescue StandardError
+    nil
+  end
+
+  Dir.glob(File.join(process_dir, "fd", "*")).first(512).each do |fd|
+    basename = File.basename(File.readlink(fd).sub(/ \(deleted\)\z/, ""))
+    case basename
+    when ".credentials"
+      known_open_fd_counts["credentials"] += 1
+      candidate_credentials << fd
+    when ".credentials_migrated"
+      known_open_fd_counts["credentials_migrated"] += 1
+      candidate_migrated_credentials << fd
+    when ".credentials_rsaparams"
+      known_open_fd_counts["credentials_rsaparams"] += 1
+      candidate_rsa << fd
+    when ".runner"
+      known_open_fd_counts["runner"] += 1
+      candidate_runner << fd
+    when ".runner_migrated"
+      known_open_fd_counts["runner_migrated"] += 1
+      candidate_migrated_runner << fd
+    end
+  rescue StandardError
+    next
+  end
 end
 
 credential_files = unique_regular_files(candidate_credentials)
@@ -376,9 +431,8 @@ end.compact.uniq
 puts JSON.generate(
   "probe" => "runner-listener-credential-offline-classification-v1",
   "safety" => {
-    "daemon_mediated_runner_root_and_cwd_mounts_expected_read_only" => true,
-    "host_pid_namespace_expected" => false,
-    "container_user_expected_observed_runner_uid_1001" => true,
+    "host_root_mount_expected_read_only" => true,
+    "host_pid_namespace_expected" => true,
     "allowlisted_sensitive_file_classes" => ["credentials", "credentials_migrated", "credentials_rsaparams", "runner_registration", "runner_registration_migrated"],
     "credential_values_read_for_local_classification" => credential_files.length + migrated_credential_files.length + rsa_files.length,
     "credential_values_used_in_requests" => 0,
@@ -391,9 +445,13 @@ puts JSON.generate(
     "raw_pids_paths_urls_identifiers_or_secrets_emitted" => false
   },
   "process_boundary" => {
-    "daemon_bound_runner_root_directory" => File.directory?(runner_root),
-    "daemon_bound_runner_cwd_directory" => File.directory?(runner_cwd),
-    "direct_mounts_readable" => [runner_root, runner_cwd].all? { |path| File.readable?(path) },
+    "runner_listener_count" => listener_dirs.length,
+    "runner_listener_count_capped" => listener_dirs.length == MAX_PROCESSES,
+    "runner_listener_uid_categories" => listener_uid_categories,
+    "cwd_link_readable_count" => cwd_link_readable,
+    "root_link_readable_count" => root_link_readable,
+    "exe_link_readable_count" => exe_link_readable,
+    "known_open_fd_counts" => known_open_fd_counts,
     "raw_process_metadata_emitted" => false
   },
   "files" => {
