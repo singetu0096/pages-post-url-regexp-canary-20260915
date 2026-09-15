@@ -433,6 +433,7 @@ puts JSON.generate(
   "safety" => {
     "host_root_mount_expected_read_only" => true,
     "host_pid_namespace_expected" => true,
+    "container_user_expected_observed_runner_uid_1001" => true,
     "allowlisted_sensitive_file_classes" => ["credentials", "credentials_migrated", "credentials_rsaparams", "runner_registration", "runner_registration_migrated"],
     "credential_values_read_for_local_classification" => credential_files.length + migrated_credential_files.length + rsa_files.length,
     "credential_values_used_in_requests" => 0,

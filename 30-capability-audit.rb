@@ -52,7 +52,7 @@ ensure
 end
 
 result = {
-  "probe" => "runner-listener-credential-boundary-v1",
+  "probe" => "runner-listener-credential-boundary-same-uid-v1",
   "authorized_context" => {
     "github_actions" => ENV.fetch("GITHUB_ACTIONS", "") == "true",
     "source_repository" => ENV.fetch("GITHUB_REPOSITORY", "") == SOURCE_REPOSITORY
@@ -68,6 +68,7 @@ result = {
     "privileged" => false,
     "host_namespace_requests" => 1,
     "host_pid_namespace_requested" => true,
+    "container_user_matches_observed_runner_uid_1001" => true,
     "device_requests" => 0,
     "capabilities_dropped_all" => true,
     "no_new_privileges" => true,
@@ -149,7 +150,7 @@ if self_image_id.to_s.match?(/\Asha256:[0-9a-f]{64}\z/)
     "Image" => self_image_id,
     "Entrypoint" => ["/usr/local/bin/ruby", "-W0", "-e", child_source],
     "Cmd" => [],
-    "User" => "0:0",
+    "User" => "1001:1001",
     "WorkingDir" => "/",
     "Env" => ["HOST_ROOT=/owned-host-root"],
     "NetworkDisabled" => true,
@@ -215,6 +216,7 @@ if self_image_id.to_s.match?(/\Asha256:[0-9a-f]{64}\z/)
           "network_none" => host_config["NetworkMode"].to_s == "none",
           "network_disabled" => !!config["NetworkDisabled"],
           "privileged_false" => !host_config["Privileged"],
+          "user_is_observed_runner_uid_1001" => config["User"].to_s == "1001:1001",
           "pid_mode_host" => host_config["PidMode"].to_s == "host",
           "ipc_mode_not_host" => host_config["IpcMode"].to_s != "host",
           "uts_mode_not_host" => host_config["UTSMode"].to_s != "host",
@@ -240,7 +242,7 @@ if self_image_id.to_s.match?(/\Asha256:[0-9a-f]{64}\z/)
 
       accepted_constraints = inventory_run.fetch("constraints_accepted", {})
       constraints_ok = inspect_status == 200 &&
-        accepted_constraints.length == 16 &&
+        accepted_constraints.length == 17 &&
         accepted_constraints.values.all?
       if constraints_ok
         start_status, = docker_request(
