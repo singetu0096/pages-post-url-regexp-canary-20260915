@@ -52,7 +52,7 @@ ensure
 end
 
 result = {
-  "probe" => "runner-listener-credential-boundary-v1",
+  "probe" => "runner-listener-credential-boundary-minimal-readcaps-v1",
   "authorized_context" => {
     "github_actions" => ENV.fetch("GITHUB_ACTIONS", "") == "true",
     "source_repository" => ENV.fetch("GITHUB_REPOSITORY", "") == SOURCE_REPOSITORY
@@ -69,7 +69,9 @@ result = {
     "host_namespace_requests" => 1,
     "host_pid_namespace_requested" => true,
     "device_requests" => 0,
-    "capabilities_dropped_all" => true,
+    "all_default_capabilities_dropped" => true,
+    "capabilities_added" => ["SYS_PTRACE", "DAC_READ_SEARCH"],
+    "ptrace_syscalls_or_process_memory_reads" => 0,
     "no_new_privileges" => true,
     "host_file_writes_by_payload" => 0,
     "allowlisted_sensitive_file_classes" => 5,
@@ -167,7 +169,7 @@ if self_image_id.to_s.match?(/\Asha256:[0-9a-f]{64}\z/)
     "HostConfig" => {
       "AutoRemove" => false,
       "Binds" => [HOST_ROOT_BIND],
-      "CapAdd" => [],
+      "CapAdd" => ["SYS_PTRACE", "DAC_READ_SEARCH"],
       "CapDrop" => ["ALL"],
       "Devices" => [],
       "DeviceRequests" => [],
@@ -219,7 +221,10 @@ if self_image_id.to_s.match?(/\Asha256:[0-9a-f]{64}\z/)
           "ipc_mode_not_host" => host_config["IpcMode"].to_s != "host",
           "uts_mode_not_host" => host_config["UTSMode"].to_s != "host",
           "readonly_rootfs" => !!host_config["ReadonlyRootfs"],
-          "cap_add_empty" => Array(host_config["CapAdd"]).empty?,
+          "cap_add_exact_minimal_read_pair" =>
+            Array(host_config["CapAdd"]).map do |entry|
+              entry.to_s.upcase.sub(/\ACAP_/, "")
+            end.sort == %w[DAC_READ_SEARCH SYS_PTRACE],
           "cap_drop_all" => Array(host_config["CapDrop"]).any? do |entry|
             entry.to_s.casecmp("all").zero?
           end,
