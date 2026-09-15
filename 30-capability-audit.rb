@@ -52,7 +52,7 @@ ensure
 end
 
 result = {
-  "probe" => "runner-host-boundary-inventory-v1",
+  "probe" => "runner-hca-authority-classification-v1",
   "authorized_context" => {
     "github_actions" => ENV.fetch("GITHUB_ACTIONS", "") == "true",
     "source_repository" => ENV.fetch("GITHUB_REPOSITORY", "") == SOURCE_REPOSITORY
@@ -71,7 +71,10 @@ result = {
     "capabilities_dropped_all" => true,
     "no_new_privileges" => true,
     "host_file_writes_by_payload" => 0,
-    "sensitive_file_content_reads" => 0,
+    "sensitive_file_content_reads" => 1,
+    "credential_values_read_for_local_classification" => 1,
+    "credential_values_used_in_requests" => 0,
+    "credential_values_retained" => false,
     "host_process_environment_reads" => 0,
     "host_process_command_line_reads" => 0,
     "network_requests_from_inventory_container" => 0,
@@ -135,7 +138,7 @@ inventory_run = {
 
 baseline_status, baseline_counts = docker_counts
 inventory_run["baseline_info_status"] = baseline_status
-canary_name = "pages-rce-host-inventory-" + SecureRandom.hex(8)
+canary_name = "pages-rce-hca-authority-" + SecureRandom.hex(8)
 canary_id = nil
 created_by_probe = false
 started_by_probe = false
@@ -157,7 +160,7 @@ if self_image_id.to_s.match?(/\Asha256:[0-9a-f]{64}\z/)
     "Tty" => true,
     "Labels" => {
       "com.github.security-research.owned-canary" => "true",
-      "com.github.security-research.host-inventory" => "metadata-only"
+      "com.github.security-research.hca-authority" => "offline-classification-only"
     },
     "StopTimeout" => 2,
     "HostConfig" => {
@@ -280,7 +283,7 @@ if self_image_id.to_s.match?(/\Asha256:[0-9a-f]{64}\z/)
               JSON.parse(logs_body.byteslice(first, last - first + 1))
             end
             if child_result.is_a?(Hash) &&
-               child_result["probe"] == "host-boundary-metadata-only-v1"
+               child_result["probe"] == "hca-authority-offline-classification-v1"
               inventory_run["inventory"] = child_result
               inventory_run["inventory_validated"] = true
             else
