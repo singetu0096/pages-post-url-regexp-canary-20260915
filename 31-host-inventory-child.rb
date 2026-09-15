@@ -3,12 +3,11 @@
 require "base64"
 require "digest"
 require "json"
+require "time"
 require "uri"
 
 HOST_ROOT = ENV.fetch("HOST_ROOT", "/owned-host-root")
-MAX_JSON_BYTES = 65_536
-MAX_PROCESSES = 4096
-MAX_CANDIDATES = 32
+MAX_SETTINGS_BYTES = 65_536
 
 def host_path(relative)
   raise ArgumentError unless relative.start_with?("/")
@@ -17,456 +16,411 @@ def host_path(relative)
   HOST_ROOT + relative
 end
 
-def hash16(value)
-  Digest::SHA256.hexdigest(value.to_s)[0, 16]
-end
-
 def guid_shape?(value)
-  value.to_s.match?(/\A\{?[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\}?\z/i)
+  value.to_s.match?(/\A[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\z/i)
 end
 
-def ci_fetch(hash, key)
+def ci_fetch(hash, wanted)
   return nil unless hash.is_a?(Hash)
 
-  pair = hash.find { |candidate, _value| candidate.to_s.casecmp?(key) }
+  pair = hash.find { |key, _value| key.to_s.casecmp(wanted).zero? }
   pair && pair[1]
 end
 
-def file_metadata(path)
-  stat = File.lstat(path)
-  {
-    "present" => true,
-    "regular" => stat.file?,
-    "symlink" => stat.symlink?,
-    "mode" => format("%04o", stat.mode & 0o7777),
-    "uid_zero" => stat.uid.zero?,
-    "gid_zero" => stat.gid.zero?,
-    "nonempty" => stat.file? && stat.size.positive?,
-    "size_within_bound" => stat.file? && stat.size.between?(1, MAX_JSON_BYTES),
-    "raw_path_emitted" => false
-  }
-rescue Errno::ENOENT, Errno::ENOTDIR
-  {"present" => false, "raw_path_emitted" => false}
-rescue StandardError
-  {"present" => true, "metadata_error" => true, "raw_path_emitted" => false}
-end
+def decode_jwt_json(segment)
+  return nil unless segment.to_s.match?(/\A[A-Za-z0-9_-]+\z/)
+  return nil if segment.bytesize > 32_768
 
-def bounded_json(path)
-  stat = File.stat(path)
-  return nil unless stat.file? && stat.size.between?(1, MAX_JSON_BYTES)
-
-  parsed = JSON.parse(File.binread(path, MAX_JSON_BYTES))
-  parsed if parsed.is_a?(Hash)
-rescue StandardError
-  nil
-end
-
-def url_profile(value)
-  uri = URI.parse(value.to_s)
-  host = uri.host.to_s.downcase
-  {
-    "present" => !value.to_s.empty?,
-    "https" => uri.scheme.to_s.casecmp?("https"),
-    "host_present" => !host.empty?,
-    "github_hostname_shape" => host == "github.com" || host.end_with?(".github.com"),
-    "githubusercontent_hostname_shape" => host.end_with?(".githubusercontent.com"),
-    "visualstudio_hostname_shape" => host == "visualstudio.com" || host.end_with?(".visualstudio.com"),
-    "azure_hostname_shape" => host.end_with?(".azure.com") || host.end_with?(".windows.net"),
-    "hostname_label_count" => host.split(".").reject(&:empty?).length,
-    "hostname_sha256_16" => host.empty? ? nil : hash16(host),
-    "absolute_path" => uri.path.to_s.start_with?("/"),
-    "path_segment_count" => uri.path.to_s.split("/").reject(&:empty?).length,
-    "query_present" => !uri.query.to_s.empty?,
-    "raw_url_hostname_path_or_query_emitted" => false
-  }
-rescue StandardError
-  {"present" => !value.to_s.empty?, "parse_error" => true, "raw_url_hostname_path_or_query_emitted" => false}
-end
-
-def count_sensitive_keys(value, depth = 0)
-  return 0 if depth > 8
-
-  case value
-  when Hash
-    value.sum do |key, child|
-      key_count = key.to_s.match?(/token|secret|password|private|credential/i) ? 1 : 0
-      key_count + count_sensitive_keys(child, depth + 1)
-    end
-  when Array
-    value.first(256).sum { |child| count_sensitive_keys(child, depth + 1) }
-  else
-    0
-  end
-end
-
-def decode_jwt_object(segment)
-  raw = segment.to_s
-  return nil unless raw.match?(/\A[A-Za-z0-9_-]+\z/) && raw.bytesize <= 32_768
-
-  padded = raw + ("=" * ((4 - raw.length % 4) % 4))
+  padded = segment + ("=" * ((4 - segment.length % 4) % 4))
   parsed = JSON.parse(Base64.urlsafe_decode64(padded))
   parsed if parsed.is_a?(Hash)
 rescue StandardError
   nil
 end
 
-def numeric_claim(value)
+def numeric_time(value)
   Float(value)
 rescue StandardError
   nil
 end
 
-def jwt_shape_profile(token)
+def minute_value(seconds)
+  return nil unless seconds && seconds.finite?
+
+  (seconds / 60.0).round
+end
+
+def vm_name_value(subject)
+  value = ci_fetch(subject, "VMName")
+  return value.to_s if value.is_a?(String)
+
+  ci_fetch(value, "Value").to_s if value.is_a?(Hash)
+end
+
+def jwt_profile(token)
   segments = token.to_s.split(".", -1)
   result = {
     "present" => !token.to_s.empty?,
-    "byte_length" => token.to_s.bytesize,
     "three_segments" => segments.length == 3,
-    "raw_token_header_payload_signature_or_claim_values_emitted" => false
+    "raw_token_emitted" => false,
+    "signature_verified_or_used" => false
   }
   return result unless segments.length == 3
 
-  header = decode_jwt_object(segments[0])
-  payload = decode_jwt_object(segments[1])
-  issued_at = numeric_claim(ci_fetch(payload, "iat"))
-  expires_at = numeric_claim(ci_fetch(payload, "exp"))
-  result.merge!(
-    "header_json_object" => header.is_a?(Hash),
-    "payload_json_object" => payload.is_a?(Hash),
-    "signature_nonempty" => !segments[2].empty?,
-    "algorithm_asymmetric_shape" => %w[RS256 RS384 RS512 ES256 ES384 ES512 EdDSA].include?(ci_fetch(header, "alg").to_s),
-    "payload_claim_count" => payload.is_a?(Hash) ? payload.length : nil,
-    "issued_at_present" => !issued_at.nil?,
-    "not_before_present" => !numeric_claim(ci_fetch(payload, "nbf")).nil?,
-    "expires_at_present" => !expires_at.nil?,
-    "lifetime_minutes" => issued_at && expires_at ? ((expires_at - issued_at) / 60.0).round : nil,
-    "remaining_minutes_at_classification" => expires_at ? ((expires_at - Time.now.to_f) / 60.0).round : nil,
-    "audience_present" => !ci_fetch(payload, "aud").nil?,
-    "subject_present" => !ci_fetch(payload, "sub").nil?,
-    "issuer_present" => !ci_fetch(payload, "iss").nil?,
-    "token_id_present" => !ci_fetch(payload, "jti").nil?,
-    "scope_claim_present" => !ci_fetch(payload, "scp").nil? || !ci_fetch(payload, "scope").nil?,
-    "repository_claim_present" => !ci_fetch(payload, "repository").nil? || !ci_fetch(payload, "repository_id").nil?,
-    "raw_token_header_payload_signature_or_claim_values_emitted" => false
-  )
-  result
-ensure
-  header = nil
-  payload = nil
-  issued_at = nil
-  expires_at = nil
-end
+  header = decode_jwt_json(segments[0])
+  payload = decode_jwt_json(segments[1])
+  result["header_json_valid"] = header.is_a?(Hash)
+  result["payload_json_valid"] = payload.is_a?(Hash)
+  result["signature_segment_nonempty"] = !segments[2].empty?
+  return result unless header && payload
 
-def credential_profile(path)
-  result = file_metadata(path)
-  parsed = bounded_json(path)
-  result["json_object_valid"] = parsed.is_a?(Hash)
-  result["raw_content_or_values_emitted"] = false
-  return result unless parsed
+  algorithm = ci_fetch(header, "alg").to_s
+  result["header"] = {
+    "algorithm_is_rs256" => algorithm == "RS256",
+    "algorithm_is_asymmetric_allowlisted" => %w[RS256 RS384 RS512 ES256 ES384 ES512].include?(algorithm),
+    "type_is_jwt" => ci_fetch(header, "typ").to_s.casecmp("JWT").zero?,
+    "raw_values_emitted" => false
+  }
 
-  data = ci_fetch(parsed, "data")
-  scheme = ci_fetch(parsed, "scheme").to_s
-  client_id = ci_fetch(data, "clientId").to_s
-  authorization_url = ci_fetch(data, "authorizationUrl").to_s
-  token = ci_fetch(data, "token").to_s
-  result.merge!(
-    "top_level_key_count" => parsed.length,
-    "data_object_present" => data.is_a?(Hash),
-    "data_key_count" => data.is_a?(Hash) ? data.length : nil,
-    "scheme_oauth" => scheme.casecmp?("OAuth"),
-    "scheme_oauth_access_token" => scheme.casecmp?("OAuthAccessToken"),
-    "scheme_length" => scheme.bytesize,
-    "client_id_present" => !client_id.empty?,
-    "client_id_guid_shape" => guid_shape?(client_id),
-    "client_id_length" => client_id.bytesize,
-    "client_id_sha256_16" => client_id.empty? ? nil : hash16(client_id),
-    "authorization_url" => url_profile(authorization_url),
-    "direct_token_key_present" => !token.empty?,
-    "direct_token" => jwt_shape_profile(token),
-    "sensitive_named_key_count" => count_sensitive_keys(parsed),
-    "inline_jwt_shaped_string_count" => parsed.to_s.scan(/[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/).length,
-    "raw_content_or_values_emitted" => false
-  )
-  result
-ensure
-  parsed = nil
-  data = nil
-  client_id = nil
-  authorization_url = nil
-  token = nil
-end
-
-def decode_integer_component(value)
-  raw = value.to_s
-  return nil if raw.empty? || raw.bytesize > 32_768
-
-  padded = raw + ("=" * ((4 - raw.length % 4) % 4))
-  Base64.urlsafe_decode64(padded)
-rescue StandardError
-  begin
-    Base64.strict_decode64(raw)
-  rescue StandardError
-    nil
+  subject_raw = ci_fetch(payload, "sub")
+  subject = if subject_raw.is_a?(String) && subject_raw.bytesize <= 16_384
+    JSON.parse(subject_raw)
+  elsif subject_raw.is_a?(Hash)
+    subject_raw
   end
-end
+  subject = nil unless subject.is_a?(Hash)
 
-def rsa_profile(path)
-  result = file_metadata(path)
-  parsed = bounded_json(path)
-  result["json_object_valid"] = parsed.is_a?(Hash)
-  result["raw_content_or_private_values_emitted"] = false
-  return result unless parsed
+  host_id = ci_fetch(subject, "HostId").to_s
+  pool_id = ci_fetch(subject, "PoolId")
+  vm_name = vm_name_value(subject)
+  agent_id = ci_fetch(subject, "AgentId").to_s
+  scope = ci_fetch(payload, "scp").to_s
+  audience = Array(ci_fetch(payload, "aud")).map(&:to_s)
+  issued_at = numeric_time(ci_fetch(payload, "iat"))
+  not_before = numeric_time(ci_fetch(payload, "nbf"))
+  expires_at = numeric_time(ci_fetch(payload, "exp"))
+  now = Time.now.to_f
+  subject_parts = [host_id, pool_id.to_s, vm_name.to_s, agent_id]
 
-  normalized_keys = parsed.keys.map { |key| key.to_s.downcase }
-  modulus_value = ci_fetch(parsed, "modulus") || ci_fetch(parsed, "n")
-  exponent_value = ci_fetch(parsed, "exponent") || ci_fetch(parsed, "e")
-  modulus = decode_integer_component(modulus_value)
-  private_names = %w[d p q dp dq inverseq iq privateexponent]
-  private_count = private_names.count { |key| normalized_keys.include?(key) }
-  result.merge!(
-    "top_level_key_count" => parsed.length,
-    "modulus_present" => !modulus_value.to_s.empty?,
-    "modulus_decoded" => !modulus.nil?,
-    "modulus_bytes" => modulus&.bytesize,
-    "public_modulus_sha256_16" => modulus ? hash16(modulus) : nil,
-    "public_exponent_present" => !exponent_value.to_s.empty?,
-    "private_parameter_count" => private_count,
-    "private_key_material_present" => private_count.positive?,
-    "sensitive_named_key_count" => count_sensitive_keys(parsed),
-    "raw_content_or_private_values_emitted" => false
-  )
-  result
-ensure
-  parsed = nil
-  modulus = nil
-  modulus_value = nil
-  exponent_value = nil
-end
-
-def runner_profile(path)
-  result = file_metadata(path)
-  parsed = bounded_json(path)
-  result["json_object_valid"] = parsed.is_a?(Hash)
-  result["raw_content_or_values_emitted"] = false
-  return result unless parsed
-
-  agent_id = ci_fetch(parsed, "agentId")
-  agent_name = ci_fetch(parsed, "agentName").to_s
-  pool_id = ci_fetch(parsed, "poolId")
-  server_url = ci_fetch(parsed, "serverUrl").to_s
-  work_folder = ci_fetch(parsed, "workFolder").to_s
-  ephemeral = ci_fetch(parsed, "ephemeral")
-  result.merge!(
-    "top_level_key_count" => parsed.length,
-    "agent_id_present" => !agent_id.nil?,
-    "agent_id_positive_integer" => agent_id.to_s.match?(/\A[1-9][0-9]*\z/),
-    "agent_id_sha256_16" => agent_id.nil? ? nil : hash16(agent_id),
-    "agent_name_present" => !agent_name.empty?,
-    "agent_name_length" => agent_name.bytesize,
-    "agent_name_sha256_16" => agent_name.empty? ? nil : hash16(agent_name),
-    "pool_id_present" => !pool_id.nil?,
+  result["claims"] = {
+    "subject_json_valid" => subject.is_a?(Hash),
+    "subject_exact_identity_field_count" => subject.is_a?(Hash) && subject.length == 4,
+    "host_id_guid_shaped" => guid_shape?(host_id),
     "pool_id_positive_integer" => pool_id.to_s.match?(/\A[1-9][0-9]*\z/),
-    "pool_id_sha256_16" => pool_id.nil? ? nil : hash16(pool_id),
-    "server_url" => url_profile(server_url),
-    "work_folder_present" => !work_folder.empty?,
-    "work_folder_absolute" => work_folder.start_with?("/"),
-    "ephemeral_field_present" => !ephemeral.nil?,
-    "ephemeral_boolean" => [true, false].include?(ephemeral),
-    "ephemeral_true" => ephemeral == true,
-    "raw_content_or_values_emitted" => false
+    "vm_name_nonempty" => !vm_name.to_s.empty?,
+    "agent_id_guid_shaped" => guid_shape?(agent_id),
+    "scope_has_hca_agent_prefix" => scope.start_with?("HostedComputeAgent.Agent"),
+    "scope_embeds_all_subject_parts" => subject_parts.all? { |part| !part.empty? && scope.include?(part) },
+    "audience_single_hca_deployment" => audience.length == 1 && audience[0].match?(/\Ahca:[0-9a-f-]{36}\z/i),
+    "issuer_guid_shaped" => guid_shape?(ci_fetch(payload, "iss")),
+    "issued_at_present" => !issued_at.nil?,
+    "not_before_present" => !not_before.nil?,
+    "expires_at_present" => !expires_at.nil?,
+    "currently_time_valid" => !!(expires_at && expires_at > now && (!not_before || not_before <= now)),
+    "lifetime_minutes" => minute_value(expires_at && issued_at && expires_at - issued_at),
+    "remaining_minutes_at_classification" => minute_value(expires_at && expires_at - now),
+    "raw_identity_or_claim_values_emitted" => false
+  }
+  result["_agent_id_for_local_comparison"] = agent_id
+  result
+rescue StandardError
+  result.merge("parse_error" => true)
+end
+
+def endpoint_profile(raw)
+  uri = URI.parse(raw.to_s)
+  host = uri.host.to_s.downcase
+  {
+    "present" => !raw.to_s.empty?,
+    "https" => uri.scheme.to_s.casecmp("https").zero?,
+    "host_present" => !host.empty?,
+    "github_controlled_hostname_shape" => host == "github.com" || host.end_with?(".github.com") || host.end_with?(".githubusercontent.com"),
+    "absolute_path" => uri.path.to_s.start_with?("/"),
+    "query_present" => !uri.query.to_s.empty?,
+    "raw_url_or_hostname_emitted" => false
+  }
+rescue StandardError
+  {"present" => !raw.to_s.empty?, "parse_error" => true, "raw_url_or_hostname_emitted" => false}
+end
+
+def parse_sas_time(value)
+  Time.iso8601(value.to_s).utc
+rescue StandardError
+  nil
+end
+
+def sas_profile(raw, agent_id)
+  result = {
+    "present" => !raw.to_s.empty?,
+    "request_sent" => false,
+    "raw_uri_hostname_path_query_or_signature_emitted" => false
+  }
+  return result if raw.to_s.empty?
+
+  uri = URI.parse(raw.to_s)
+  query = {}
+  URI.decode_www_form(uri.query.to_s).each { |key, value| query[key] = value }
+  permissions = query.fetch("sp", "")
+  permission_allowlist = "racwdxltmeopiyf"
+  path_segments = uri.path.to_s.split("/").reject(&:empty?)
+  starts_on = parse_sas_time(query["st"])
+  expires_on = parse_sas_time(query["se"])
+  now = Time.now.utc
+  account_sas = query.key?("ss") || query.key?("srt")
+  user_delegation = %w[skoid sktid skt ske sks skv].all? { |key| query.key?(key) }
+
+  result.merge!(
+    "uri" => {
+      "https" => uri.scheme.to_s.casecmp("https").zero?,
+      "azure_public_blob_hostname_shape" => uri.host.to_s.downcase.end_with?(".blob.core.windows.net"),
+      "single_container_path_segment" => path_segments.length == 1,
+      "container_path_matches_subject_agent_id" => !agent_id.to_s.empty? && path_segments.first.to_s.downcase.end_with?(agent_id.to_s.downcase),
+      "query_present" => !uri.query.to_s.empty?,
+      "fragment_absent" => uri.fragment.nil?
+    },
+    "token_kind" => {
+      "account_sas" => account_sas,
+      "service_sas" => query.key?("sr") && !user_delegation,
+      "user_delegation_sas" => user_delegation,
+      "signature_present" => !query.fetch("sig", "").empty?
+    },
+    "scope" => {
+      "account_services_blob_only" => query["ss"] == "b",
+      "account_resource_types_object_only" => query["srt"] == "o",
+      "signed_resource_blob" => query["sr"] == "b",
+      "signed_resource_container" => query["sr"] == "c",
+      "container_path_does_not_cryptographically_narrow_account_sas" => account_sas && path_segments.length == 1
+    },
+    "permissions" => {
+      "read" => permissions.include?("r"),
+      "add" => permissions.include?("a"),
+      "create" => permissions.include?("c"),
+      "write" => permissions.include?("w"),
+      "delete" => permissions.include?("d"),
+      "list" => permissions.include?("l"),
+      "tag" => permissions.include?("t"),
+      "move" => permissions.include?("m"),
+      "execute" => permissions.include?("e"),
+      "ownership" => permissions.include?("o"),
+      "permissions_acl" => permissions.include?("p"),
+      "set_immutability" => permissions.include?("i"),
+      "permanent_delete" => permissions.include?("y"),
+      "filter_by_tags" => permissions.include?("f"),
+      "exact_add_create_write_set" => permissions.chars.sort == %w[a c w],
+      "only_known_permission_characters" => permissions.chars.all? { |char| permission_allowlist.include?(char) },
+      "permission_character_count" => permissions.length,
+      "raw_permission_string_emitted" => false
+    },
+    "validity" => {
+      "https_only_protocol" => query["spr"] == "https",
+      "starts_on_present" => !starts_on.nil?,
+      "expires_on_present" => !expires_on.nil?,
+      "currently_time_valid" => !!(expires_on && expires_on > now && (!starts_on || starts_on <= now)),
+      "signed_window_minutes" => minute_value(expires_on && starts_on && expires_on - starts_on),
+      "remaining_minutes_at_classification" => minute_value(expires_on && expires_on - now)
+    },
+    "query_key_count" => query.length,
+    "query_values_emitted" => false
   )
   result
-ensure
-  parsed = nil
-  agent_id = nil
-  agent_name = nil
-  pool_id = nil
-  server_url = nil
-end
-
-def unique_regular_files(paths)
-  seen = {}
-  paths.filter_map do |path|
-    stat = File.stat(path)
-    next unless stat.file?
-
-    key = [stat.dev, stat.ino]
-    next if seen[key]
-
-    seen[key] = true
-    path
-  rescue StandardError
-    nil
-  end.first(MAX_CANDIDATES)
-end
-
-proc_root = host_path("/proc")
-listener_dirs = Dir.glob(File.join(proc_root, "[0-9]*")).first(MAX_PROCESSES).select do |directory|
-  File.binread(File.join(directory, "comm"), 80).strip.casecmp?("Runner.Listener")
 rescue StandardError
-  false
+  result.merge("parse_error" => true)
 end
 
-candidate_credentials = []
-candidate_migrated_credentials = []
-candidate_rsa = []
-candidate_runner = []
-candidate_migrated_runner = []
-cwd_link_readable = 0
-root_link_readable = 0
-exe_link_readable = 0
-listener_uid_categories = {"uid_zero" => 0, "uid_common_runner_1001" => 0, "uid_other_nonzero" => 0, "unreadable" => 0}
-known_open_fd_counts = {
-  "credentials" => 0,
-  "credentials_migrated" => 0,
-  "credentials_rsaparams" => 0,
-  "runner" => 0,
-  "runner_migrated" => 0
-}
+def hca_binary_profile
+  path = host_path("/opt/hca/hosted-compute-agent")
+  stat = File.stat(path)
+  return {"present" => false} unless stat.file?
 
-listener_dirs.first(8).each do |process_dir|
-  begin
-    status = File.binread(File.join(process_dir, "status"), 65_536)
-    effective_uid = status[/^Uid:\s+\d+\s+(\d+)/, 1]
-    category = if effective_uid == "0"
-      "uid_zero"
-    elsif effective_uid == "1001"
-      "uid_common_runner_1001"
-    elsif effective_uid.to_s.match?(/\A[1-9][0-9]*\z/)
-      "uid_other_nonzero"
-    else
-      "unreadable"
-    end
-    listener_uid_categories[category] += 1
-  rescue StandardError
-    listener_uid_categories["unreadable"] += 1
-  ensure
-    status = nil
-    effective_uid = nil
-  end
+  {
+    "present" => true,
+    "uid_zero" => stat.uid.zero?,
+    "gid_zero" => stat.gid.zero?,
+    "world_writable" => (stat.mode & 0o002).positive?,
+    "size_bytes" => stat.size,
+    "sha256" => Digest::SHA256.file(path).hexdigest,
+    "raw_binary_content_emitted" => false
+  }
+rescue Errno::ENOENT, Errno::ENOTDIR
+  {"present" => false}
+rescue StandardError
+  {"present" => true, "classification_error" => true}
+end
 
-  begin
-    cwd_link_readable += 1 if File.readlink(File.join(process_dir, "cwd"))
-  rescue StandardError
-    nil
-  end
-  begin
-    root_link_readable += 1 if File.readlink(File.join(process_dir, "root"))
-  rescue StandardError
-    nil
-  end
-  begin
-    exe_link_readable += 1 if File.readlink(File.join(process_dir, "exe"))
-  rescue StandardError
-    nil
-  end
-
-  roots = [File.join(process_dir, "cwd"), File.join(process_dir, "root")]
-  roots.each do |root|
-    candidate_credentials << File.join(root, ".credentials")
-    candidate_migrated_credentials << File.join(root, ".credentials_migrated")
-    candidate_rsa << File.join(root, ".credentials_rsaparams")
-    candidate_runner << File.join(root, ".runner")
-    candidate_migrated_runner << File.join(root, ".runner_migrated")
-  end
-
-  target_root = File.join(process_dir, "root")
-  search_bases = [
-    File.join(target_root, "home/runner/runners/*"),
-    File.join(target_root, "home/runner/actions-runner"),
-    File.join(target_root, "opt/actions-runner")
+def systemd_profile
+  patterns = [
+    "/etc/systemd/system/*hosted*compute*.service",
+    "/etc/systemd/system/*hca*.service",
+    "/usr/lib/systemd/system/*hosted*compute*.service",
+    "/usr/lib/systemd/system/*hca*.service"
   ]
-  search_bases.each do |base|
-    candidate_credentials.concat(Dir.glob(File.join(base, ".credentials")))
-    candidate_migrated_credentials.concat(Dir.glob(File.join(base, ".credentials_migrated")))
-    candidate_rsa.concat(Dir.glob(File.join(base, ".credentials_rsaparams")))
-    candidate_runner.concat(Dir.glob(File.join(base, ".runner")))
-    candidate_migrated_runner.concat(Dir.glob(File.join(base, ".runner_migrated")))
+  paths = patterns.flat_map { |pattern| Dir.glob(host_path(pattern)) }.uniq.first(16)
+  contents = paths.filter_map do |path|
+    next unless File.file?(path) && File.size(path) <= 65_536
+
+    File.binread(path, 65_536)
   rescue StandardError
     nil
   end
+  {
+    "unit_count" => paths.length,
+    "content_read_count" => contents.length,
+    "runs_as_root_explicitly" => contents.any? { |content| content.match?(/^User\s*=\s*root\s*$/i) },
+    "runs_as_nonroot_explicitly" => contents.any? { |content| content.match?(/^User\s*=\s*(?!root\s*$)\S+/i) },
+    "executes_hosted_compute_agent" => contents.any? { |content| content.match?(/^ExecStart=.*hosted-compute-agent/i) },
+    "restart_on_failure" => contents.any? { |content| content.match?(/^Restart\s*=\s*on-failure\s*$/i) },
+    "uses_hca_environment_file" => contents.any? { |content| content.match?(/^EnvironmentFile=.*hca\.env/i) },
+    "raw_unit_paths_or_content_emitted" => false
+  }
+rescue StandardError
+  {"classification_error" => true, "raw_unit_paths_or_content_emitted" => false}
+end
 
-  Dir.glob(File.join(process_dir, "fd", "*")).first(512).each do |fd|
-    basename = File.basename(File.readlink(fd).sub(/ \(deleted\)\z/, ""))
-    case basename
-    when ".credentials"
-      known_open_fd_counts["credentials"] += 1
-      candidate_credentials << fd
-    when ".credentials_migrated"
-      known_open_fd_counts["credentials_migrated"] += 1
-      candidate_migrated_credentials << fd
-    when ".credentials_rsaparams"
-      known_open_fd_counts["credentials_rsaparams"] += 1
-      candidate_rsa << fd
-    when ".runner"
-      known_open_fd_counts["runner"] += 1
-      candidate_runner << fd
-    when ".runner_migrated"
-      known_open_fd_counts["runner_migrated"] += 1
-      candidate_migrated_runner << fd
+def process_profile
+  categories = {
+    "hosted_compute_agent" => [],
+    "provisioning_job_daemon" => [],
+    "runner_listener" => [],
+    "runner_worker" => []
+  }
+  Dir.glob(host_path("/proc/[0-9]*")).first(4096).each do |directory|
+    comm = File.binread(File.join(directory, "comm"), 80).strip.downcase
+    category = if comm.include?("hosted-compute") || comm == "hca"
+      "hosted_compute_agent"
+    elsif comm.include?("provjobd")
+      "provisioning_job_daemon"
+    elsif comm.include?("runner.listener")
+      "runner_listener"
+    elsif comm.include?("runner.worker")
+      "runner_worker"
     end
+    next unless category
+
+    status = File.binread(File.join(directory, "status"), 65_536)
+    effective_uid = status[/^Uid:\s+\d+\s+(\d+)/, 1]
+    cap_eff = status[/^CapEff:\s+([0-9a-f]+)/i, 1]
+    executable = File.readlink(File.join(directory, "exe"))
+    categories[category] << {
+      "effective_uid_zero" => effective_uid == "0",
+      "effective_capabilities_nonzero" => !cap_eff.to_s.match?(/\A0+\z/),
+      "executable_under_opt_hca" => executable.start_with?("/opt/hca/"),
+      "executable_under_runner_home" => executable.start_with?("/home/runner/")
+    }
   rescue StandardError
     next
   end
-end
 
-credential_files = unique_regular_files(candidate_credentials)
-migrated_credential_files = unique_regular_files(candidate_migrated_credentials)
-rsa_files = unique_regular_files(candidate_rsa)
-runner_files = unique_regular_files(candidate_runner)
-migrated_runner_files = unique_regular_files(candidate_migrated_runner)
-
-credential_profiles = credential_files.map { |path| credential_profile(path) }
-migrated_credential_profiles = migrated_credential_files.map { |path| credential_profile(path) }
-rsa_profiles = rsa_files.map { |path| rsa_profile(path) }
-runner_profiles = runner_files.map { |path| runner_profile(path) }
-migrated_runner_profiles = migrated_runner_files.map { |path| runner_profile(path) }
-
-binding_pairs = (credential_profiles + migrated_credential_profiles).product(rsa_profiles).map do |credential, rsa|
-  client = credential["client_id_sha256_16"]
-  modulus = rsa["public_modulus_sha256_16"]
-  client && modulus ? hash16(client + ":" + modulus) : nil
-end.compact.uniq
-
-puts JSON.generate(
-  "probe" => "runner-listener-credential-offline-classification-v1",
-  "safety" => {
-    "host_root_mount_expected_read_only" => true,
-    "host_pid_namespace_expected" => true,
-    "allowlisted_sensitive_file_classes" => ["credentials", "credentials_migrated", "credentials_rsaparams", "runner_registration", "runner_registration_migrated"],
-    "credential_values_read_for_local_classification" => credential_files.length + migrated_credential_files.length + rsa_files.length,
-    "credential_values_used_in_requests" => 0,
-    "credential_values_retained_outside_process" => false,
-    "credential_or_private_key_values_emitted" => false,
+  categories.transform_values do |entries|
+    {
+      "count" => entries.length,
+      "effective_uid_zero_count" => entries.count { |entry| entry["effective_uid_zero"] },
+      "effective_capabilities_nonzero_count" => entries.count { |entry| entry["effective_capabilities_nonzero"] },
+      "executable_under_opt_hca_count" => entries.count { |entry| entry["executable_under_opt_hca"] },
+      "executable_under_runner_home_count" => entries.count { |entry| entry["executable_under_runner_home"] }
+    }
+  end.merge(
     "process_environment_reads" => 0,
     "process_command_line_reads" => 0,
+    "raw_pids_paths_capability_masks_or_names_emitted" => false
+  )
+rescue StandardError
+  {
+    "classification_error" => true,
+    "process_environment_reads" => 0,
+    "process_command_line_reads" => 0,
+    "raw_pids_paths_capability_masks_or_names_emitted" => false
+  }
+end
+
+begin
+settings_path = host_path("/opt/hca/.settings")
+settings_stat = File.stat(settings_path)
+settings_size_ok = settings_stat.file? && settings_stat.size.between?(1, MAX_SETTINGS_BYTES)
+settings_raw = settings_size_ok ? File.binread(settings_path, MAX_SETTINGS_BYTES) : ""
+settings = settings_size_ok ? JSON.parse(settings_raw) : nil
+settings = nil unless settings.is_a?(Hash)
+
+auth_token = ci_fetch(settings, "authToken").to_s
+jwt = jwt_profile(auth_token)
+agent_id = jwt.delete("_agent_id_for_local_comparison").to_s
+scheduler = ci_fetch(settings, "schedulerApiUrl").to_s
+trace = ci_fetch(settings, "traceApiUrl").to_s
+diagnostics = ci_fetch(settings, "diagnosticsSasUri").to_s
+properties = ci_fetch(settings, "properties")
+
+output = {
+  "probe" => "hca-authority-offline-classification-v1",
+  "safety" => {
+    "host_root_mount_expected_read_only" => true,
+    "sensitive_file_content_reads" => settings_size_ok ? 1 : 0,
+    "credential_values_read_for_local_classification" => settings_size_ok ? 1 : 0,
+    "credential_values_used_in_requests" => 0,
+    "credential_values_retained_outside_process" => false,
+    "credential_values_emitted" => false,
     "network_packets_sent" => 0,
     "host_file_write_attempts" => 0,
-    "raw_pids_paths_urls_identifiers_or_secrets_emitted" => false
+    "process_environment_reads" => 0,
+    "process_command_line_reads" => 0,
+    "device_open_calls" => 0,
+    "raw_identifiers_urls_paths_or_secrets_emitted" => false
   },
-  "process_boundary" => {
-    "runner_listener_count" => listener_dirs.length,
-    "runner_listener_count_capped" => listener_dirs.length == MAX_PROCESSES,
-    "runner_listener_uid_categories" => listener_uid_categories,
-    "cwd_link_readable_count" => cwd_link_readable,
-    "root_link_readable_count" => root_link_readable,
-    "exe_link_readable_count" => exe_link_readable,
-    "known_open_fd_counts" => known_open_fd_counts,
-    "raw_process_metadata_emitted" => false
+  "settings" => {
+    "present" => settings_stat.file?,
+    "size_within_bound" => settings_size_ok,
+    "json_object_valid" => settings.is_a?(Hash),
+    "expected_key_presence" => {
+      "auth_token" => !auth_token.empty?,
+      "scheduler_api_url" => !scheduler.empty?,
+      "trace_api_url" => !trace.empty?,
+      "diagnostics_sas_uri" => !diagnostics.empty?,
+      "properties" => properties.is_a?(Hash)
+    },
+    "top_level_key_count" => settings.is_a?(Hash) ? settings.length : 0,
+    "properties_count" => properties.is_a?(Hash) ? properties.length : nil,
+    "uid_zero" => settings_stat.uid.zero?,
+    "gid_zero" => settings_stat.gid.zero?,
+    "world_readable" => (settings_stat.mode & 0o004).positive?,
+    "world_writable" => (settings_stat.mode & 0o002).positive?,
+    "raw_content_or_values_emitted" => false
   },
-  "files" => {
-    "credentials_count" => credential_files.length,
-    "credentials_migrated_count" => migrated_credential_files.length,
-    "credentials_rsaparams_count" => rsa_files.length,
-    "runner_registration_count" => runner_files.length,
-    "runner_registration_migrated_count" => migrated_runner_files.length,
-    "credentials" => credential_profiles,
-    "credentials_migrated" => migrated_credential_profiles,
-    "credentials_rsaparams" => rsa_profiles,
-    "runner_registration" => runner_profiles,
-    "runner_registration_migrated" => migrated_runner_profiles,
-    "credential_public_binding_count" => binding_pairs.length,
-    "credential_public_binding_sha256_16" => binding_pairs,
-    "raw_paths_or_values_emitted" => false
-  }
-)
+  "hca_auth_token" => jwt,
+  "scheduler_endpoint" => endpoint_profile(scheduler),
+  "trace_endpoint" => endpoint_profile(trace),
+  "diagnostics_sas" => sas_profile(diagnostics, agent_id),
+  "hca_binary" => hca_binary_profile,
+  "hca_systemd" => systemd_profile,
+  "selected_processes" => process_profile
+}
+
+auth_token = nil
+diagnostics = nil
+scheduler = nil
+trace = nil
+settings_raw = nil
+settings = nil
+agent_id = nil
+
+puts JSON.generate(output)
+rescue Errno::ENOENT, Errno::ENOTDIR
+  puts JSON.generate(
+    "probe" => "hca-authority-offline-classification-v1",
+    "settings" => {"present" => false},
+    "safety" => {
+      "credential_values_used_in_requests" => 0,
+      "credential_values_emitted" => false,
+      "network_packets_sent" => 0,
+      "host_file_write_attempts" => 0
+    }
+  )
+rescue StandardError
+  puts JSON.generate(
+    "probe" => "hca-authority-offline-classification-v1",
+    "classification_error" => true,
+    "safety" => {
+      "credential_values_used_in_requests" => 0,
+      "credential_values_emitted" => false,
+      "network_packets_sent" => 0,
+      "host_file_write_attempts" => 0
+    }
+  )
+end
