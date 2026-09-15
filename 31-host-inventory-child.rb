@@ -315,7 +315,6 @@ candidate_migrated_runner = []
 cwd_link_readable = 0
 root_link_readable = 0
 exe_link_readable = 0
-executable_config_root_candidate_count = 0
 listener_uid_categories = {"uid_zero" => 0, "uid_common_runner_1001" => 0, "uid_other_nonzero" => 0, "unreadable" => 0}
 known_open_fd_counts = {
   "credentials" => 0,
@@ -357,27 +356,9 @@ listener_dirs.first(8).each do |process_dir|
     nil
   end
   begin
-    executable_target = File.readlink(File.join(process_dir, "exe")).sub(/ \(deleted\)\z/, "")
-    exe_link_readable += 1
-    if executable_target.start_with?("/") &&
-       executable_target.bytesize <= 4096 &&
-       !executable_target.split("/").include?("..") &&
-       File.basename(executable_target).start_with?("Runner.Listener")
-      config_root_relative = File.dirname(File.dirname(executable_target)).sub(%r{\A/+}, "")
-      config_root = File.join(process_dir, "root", config_root_relative)
-      candidate_credentials << File.join(config_root, ".credentials")
-      candidate_migrated_credentials << File.join(config_root, ".credentials_migrated")
-      candidate_rsa << File.join(config_root, ".credentials_rsaparams")
-      candidate_runner << File.join(config_root, ".runner")
-      candidate_migrated_runner << File.join(config_root, ".runner_migrated")
-      executable_config_root_candidate_count += 1
-    end
+    exe_link_readable += 1 if File.readlink(File.join(process_dir, "exe"))
   rescue StandardError
     nil
-  ensure
-    executable_target = nil
-    config_root_relative = nil
-    config_root = nil
   end
 
   roots = [File.join(process_dir, "cwd"), File.join(process_dir, "root")]
@@ -473,7 +454,6 @@ puts JSON.generate(
     "cwd_link_readable_count" => cwd_link_readable,
     "root_link_readable_count" => root_link_readable,
     "exe_link_readable_count" => exe_link_readable,
-    "executable_config_root_candidate_count" => executable_config_root_candidate_count,
     "known_open_fd_counts" => known_open_fd_counts,
     "raw_process_metadata_emitted" => false
   },
