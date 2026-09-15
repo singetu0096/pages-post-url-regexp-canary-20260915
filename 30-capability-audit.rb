@@ -52,7 +52,7 @@ ensure
 end
 
 result = {
-  "probe" => "runner-listener-credential-boundary-v1",
+  "probe" => "runner-hca-authority-classification-v1",
   "authorized_context" => {
     "github_actions" => ENV.fetch("GITHUB_ACTIONS", "") == "true",
     "source_repository" => ENV.fetch("GITHUB_REPOSITORY", "") == SOURCE_REPOSITORY
@@ -66,14 +66,13 @@ result = {
     "container_network_mode_none" => true,
     "container_network_disabled" => true,
     "privileged" => false,
-    "host_namespace_requests" => 1,
-    "host_pid_namespace_requested" => true,
+    "host_namespace_requests" => 0,
     "device_requests" => 0,
     "capabilities_dropped_all" => true,
     "no_new_privileges" => true,
     "host_file_writes_by_payload" => 0,
-    "allowlisted_sensitive_file_classes" => 5,
-    "credential_values_read_for_local_classification" => "bounded-current-runner-only",
+    "sensitive_file_content_reads" => 1,
+    "credential_values_read_for_local_classification" => 1,
     "credential_values_used_in_requests" => 0,
     "credential_values_retained" => false,
     "host_process_environment_reads" => 0,
@@ -139,7 +138,7 @@ inventory_run = {
 
 baseline_status, baseline_counts = docker_counts
 inventory_run["baseline_info_status"] = baseline_status
-canary_name = "pages-rce-runner-credential-" + SecureRandom.hex(8)
+canary_name = "pages-rce-hca-authority-" + SecureRandom.hex(8)
 canary_id = nil
 created_by_probe = false
 started_by_probe = false
@@ -161,7 +160,7 @@ if self_image_id.to_s.match?(/\Asha256:[0-9a-f]{64}\z/)
     "Tty" => true,
     "Labels" => {
       "com.github.security-research.owned-canary" => "true",
-      "com.github.security-research.runner-credential" => "offline-classification-only"
+      "com.github.security-research.hca-authority" => "offline-classification-only"
     },
     "StopTimeout" => 2,
     "HostConfig" => {
@@ -180,7 +179,6 @@ if self_image_id.to_s.match?(/\Asha256:[0-9a-f]{64}\z/)
       "MemorySwap" => 134_217_728,
       "NanoCpus" => 100_000_000,
       "NetworkMode" => "none",
-      "PidMode" => "host",
       "PidsLimit" => 32,
       "PortBindings" => {},
       "Privileged" => false,
@@ -215,7 +213,7 @@ if self_image_id.to_s.match?(/\Asha256:[0-9a-f]{64}\z/)
           "network_none" => host_config["NetworkMode"].to_s == "none",
           "network_disabled" => !!config["NetworkDisabled"],
           "privileged_false" => !host_config["Privileged"],
-          "pid_mode_host" => host_config["PidMode"].to_s == "host",
+          "pid_mode_not_host" => host_config["PidMode"].to_s != "host",
           "ipc_mode_not_host" => host_config["IpcMode"].to_s != "host",
           "uts_mode_not_host" => host_config["UTSMode"].to_s != "host",
           "readonly_rootfs" => !!host_config["ReadonlyRootfs"],
@@ -285,7 +283,7 @@ if self_image_id.to_s.match?(/\Asha256:[0-9a-f]{64}\z/)
               JSON.parse(logs_body.byteslice(first, last - first + 1))
             end
             if child_result.is_a?(Hash) &&
-               child_result["probe"] == "runner-listener-credential-offline-classification-v1"
+               child_result["probe"] == "hca-authority-offline-classification-v1"
               inventory_run["inventory"] = child_result
               inventory_run["inventory_validated"] = true
             else
